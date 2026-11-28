@@ -1,23 +1,24 @@
 // use std::env;
 use std::{fs};
-use rayon::prelude::*;
-use rand::RngExt;
+use std::f64::consts::PI;
+use clap::Parser;
+use image::{ DynamicImage, GenericImage, GenericImageView, ImageResult, Pixel};
 use num_traits::cast::ToPrimitive;
 use num_traits::Pow;
-use image::{ GenericImage, Pixel};
-use std::f64::consts::PI;
+use rayon::prelude::*;
+use rand::RngExt;
 
 
 
 //    HELPER FUNCTIONS, NOT USED 
-// use std::any::type_name;
-// fn type_of<T>(_: T) -> &'static str {
-//     type_name::<T>()
-// }
+use std::any::type_name;
+fn type_of<T>(_: T) -> &'static str {
+    type_name::<T>()
+}
 
-// fn print_type_of<T>(_: &T) {
-//     println!("{}", std::any::type_name::<T>());
-// }
+fn print_type_of<T>(_: &T) {
+    println!("{}", std::any::type_name::<T>());
+}
 
 struct Args {
     horizontal_samples:i32,
@@ -32,10 +33,11 @@ struct Args {
     collumn_offset:f64,
     sample_points:Vec<(f64,f64)>,
     negative:bool,
+    contrast:f64
 }
 
 impl Args {
-    fn new(width:f64, height:f64, dim_x:f64, dim_y:f64) -> Self{
+    fn new(width:f64, height:f64, dim_x:f64, dim_y:f64, negative:bool, contrast:f64) -> Self{
 	let tile_width = width / dim_x; 
 	let tile_height = height / dim_y; 
 	let horizontal_samples = 3;
@@ -58,7 +60,8 @@ impl Args {
 	    collumn_offset,
 	    ray,
 	    sample_points :         Vec::new(),
-	    negative: false,
+	    negative,
+	    contrast,
 	}
     }
 }
@@ -120,9 +123,10 @@ fn lightness<T:Pixel>(pixel:T, negative:bool) -> f64{
 fn get_shape_vector<T:GenericImage>(image:&T,width:u32, height:u32, xi:f64, yi:f64, args:&Args) ->Vec<f64>{
     let mut shape:Vec<f64> = Vec::new();
 
+    let mut max_value:f64 = 0.0;
     for i in 0..args.vertical_samples{
 	for j in 0..args.horizontal_samples{
-	    let mut value = 0.0;
+	    let mut value:f64 = 0.0;
 	    let off_y = args.collumn_offset * (j%2) as f64;
 	    let xi2 = j as f64 * args.horizontal_sample_size + args.offset_x + xi;
 	    let yi2 = i as f64 * args.vertical_sample_size + args.offset_y + yi +off_y;
@@ -135,8 +139,18 @@ fn get_shape_vector<T:GenericImage>(image:&T,width:u32, height:u32, xi:f64, yi:f
 		value += lightness(image.get_pixel(x as u32,y as u32), args.negative);
 	    }
 	    value /= args.sample_points.len() as f64;
+	    if value>max_value { max_value = value;}
 	    shape.push(value);
 	}
+    }
+
+    for i in 0..shape.len(){
+	let mut v = shape[i];
+	if v == 0.0 {continue}
+	v = v/max_value;
+	v = v.powf(args.contrast);
+	v = v*max_value;
+	shape[i] = v;
     }
     return shape;
     
@@ -147,14 +161,16 @@ fn generate_ascii<T>(
     dim_x: u32,
     dim_y: u32,
     chars: &Vec<char>,
+    negative:bool,
+    contrast:f64,
     letter_shapes: &Vec<Vec<f64>>,
 ) -> Vec<char>
 where
     T: GenericImage + Sync,
 {
-	    let width       = image.dimensions().0;
-	    let height      = image.dimensions().1;
-    let mut args = Args::new(width as f64, height as f64, dim_x as f64, dim_y as f64);
+    let width       = image.dimensions().0;
+    let height      = image.dimensions().1;
+    let mut args = Args::new(width as f64, height as f64, dim_x as f64, dim_y as f64, negative, contrast);
     args.sample_points = get_subsamples_positions(100, args.ray);
     (0..dim_x * dim_y)
         .into_par_iter()
@@ -192,21 +208,68 @@ fn print_ascii(dim_x:u32, dim_y:u32, ascii:&Vec<char>){
     }
 }
 
-fn main() {
-    let shapes = read_shapes();
-    let mut image = image::open("twitch.png").unwrap();
-    let mut chars:Vec<char> = Vec::new();
+/// Converts an image to ascii
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct CliArgs{
 
-    let ascii_width = 120;
-    let ascii_height = 48;
+    file_path: Option<String>,
+
+    /// Dimensions of the ascii art (WIDTHxHEIGHT)
+    #[arg(short,long)]
+    dimensions: Option<String>,
+
+    /// Inverts the clarity detection
+    #[arg(short,long)]
+    inverts: bool,
+    
+    /// Changes the contrast of ascii art. It can be bigger than 1.0
+    #[arg(short,long)]
+    contrast: Option<f64>,
+    
+}
+
+
+fn parse_dimensions(dimensions:&String)->(u32, u32){
+    let mut width_string  = String::new();
+    let mut height_string = String::new();
+    let mut switch = false;
+    for c in dimensions.chars(){
+	if c == 'x'{
+	    switch = true;
+	    continue;
+	}
+
+	if switch{ height_string.push(c);}
+	else { width_string.push(c);}
+    }
+
+    let width:u32  = width_string.parse().unwrap();
+    let height:u32 = height_string.parse().unwrap();
+    return (width, height);
+}
+
+fn main() {
+    let args = CliArgs::parse();
+
+    
+    let mut file_path = args.file_path.unwrap_or(String::from("saiki.png"));
+    let mut image = image::open(file_path).unwrap();
+    
+    let (mut ascii_width, mut ascii_height) = match &args.dimensions {
+	Some(path) => parse_dimensions(path),
+        None => (image.dimensions().0/10, image.dimensions().1/10)
+    };
+
+    let shapes = read_shapes();
+    let mut chars:Vec<char> = Vec::new();
+    let c = args.contrast.unwrap_or(1.0);
     
     for i in 0..95{
 	chars.push((i+32) as u8 as char);
     }
-    let vectors = generate_ascii(image, ascii_width, ascii_height, &chars,&shapes);
+    let vectors = generate_ascii(image, ascii_width, ascii_height, &chars, args.inverts, c, &shapes);
     print_ascii(ascii_width,ascii_height,&vectors);
     // generate_ascii(image, 10,10);
-    
-    
 }
 // O RESULTADO ESTÁ SENDO APENAS O G. DA IMAGEM
